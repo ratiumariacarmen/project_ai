@@ -1,0 +1,132 @@
+import os
+import torch
+from docx import Document
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from datasets import Dataset
+
+# Global lists to store requirements and offers
+requirements = []
+offers = []
+
+# Initialize the tokenizer and model for GPT-Neo
+tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+
+# Set pad token to eos token for GPT-Neo tokenizer
+tokenizer.pad_token = tokenizer.eos_token
+model.resize_token_embeddings(len(tokenizer))
+
+# Function to read .docx files and extract text
+def read_docx(folder_path):
+    files = os.listdir(folder_path)
+    docx_files = [f for f in files if f.endswith('.docx')]
+    target_text_for_split = "Oferta pentru"
+
+    for docx_file in docx_files:
+        file_path = os.path.join(folder_path, docx_file)
+        document = Document(file_path)
+        all_paragraphs = [paragraph.text for paragraph in document.paragraphs]
+        full_text = '\n'.join(all_paragraphs)
+
+        if target_text_for_split in full_text:
+            parts = full_text.split(target_text_for_split)
+            if len(parts) > 1:
+                requirements.append(parts[0].strip())
+                offer_part = parts[1].strip()
+                if "Scopul documentului" in offer_part:
+                    offers.append(offer_part.split("Scopul documentului")[1].strip())
+                else:
+                    offers.append(offer_part)
+
+# Function to preprocess data
+def preprocess_data(requirements, offers):
+    return [{'text': req + '\n' + offer} for req, offer in zip(requirements, offers)]
+
+# Read and preprocess data
+read_docx("Oferte test")
+data = preprocess_data(requirements, offers)
+dataset = Dataset.from_list(data)
+
+# Tokenize function
+def tokenize_function(examples):
+    return tokenizer(examples['text'], padding='max_length', truncation=True, max_length=512)
+
+# Tokenize and prepare datasets
+tokenized_datasets = dataset.map(tokenize_function, batched=True)
+
+# Split the dataset into training and evaluation sets
+def split_dataset(dataset, split_ratio=0.1):
+    split = int(len(dataset) * split_ratio)
+    return dataset.select(range(split)), dataset.select(range(split, len(dataset)))
+
+train_dataset, eval_dataset = split_dataset(tokenized_datasets)
+
+# Collate function for training
+def collate_fn(batch):
+    input_ids = torch.stack([torch.tensor(item['input_ids']) for item in batch])
+    attention_mask = torch.stack([torch.tensor(item['attention_mask']) for item in batch])
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': input_ids  # Use input_ids as labels for language modeling
+    }
+
+# TrainingArguments configuration
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=4,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    logging_dir="./logs",
+    logging_steps=10,
+)
+
+# Initialize Trainer with both train and eval datasets
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=collate_fn,
+)
+
+# Train the model
+trainer.train()
+
+# Save the trained model and tokenizer
+model.save_pretrained("fine-tuned-gpt-neo")
+tokenizer.save_pretrained("fine-tuned-gpt-neo")
+
+model = AutoModelForCausalLM.from_pretrained("fine-tuned-gpt-neo")
+tokenizer = AutoTokenizer.from_pretrained("fine-tuned-gpt-neo")
+
+def generate_text(prompt, max_length=500, max_new_tokens=500):
+    # Tokenize the input prompt
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+
+    # Generate text
+    outputs = model.generate(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_length=inputs["input_ids"].shape[1] + max_new_tokens,
+        num_return_sequences=1,
+        pad_token_id=tokenizer.eos_token_id,
+        temperature=0.7,  # Adjust the creativity level
+        top_k=50,         # Adjust the number of highest probability tokens
+        top_p=0.9,        # Adjust the cumulative probability for nucleus sampling
+        do_sample=True    # Enable sampling
+    )
+
+    # Decode the generated text
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# Example prompt
+prompt = "Clientul solicită dezvoltarea unei aplicații de tip Glovo. Specifică următoarele secțiuni: Sistem de logistică a rider-ului.Înregistrarea restaurantelor în aplicație.Primirea comenzilor de către clienți.Posibilitatea de a adăuga sau elimina produse din meniul restaurantului.Plata cu cardul."
+
+# Generate text
+generated_text = generate_text(prompt)
+
+# Print the generated text
+print(generated_text)
